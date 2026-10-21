@@ -1,12 +1,12 @@
 #pragma once
 
 /**
- * Wired DualSense feedback on webOS via /dev/hidraw* (USB only).
+ * DualSense feedback on webOS via /dev/hidraw* (USB and Bluetooth).
  *
  * Host (Vibepollo/Sunshine) still sends Moonlight 0x5503/LED packets; this module
- * applies them as full 0x02 output reports. Bluetooth pads need a separate Luna
- * path and are not claimed here. Rumble stays on SDL/EV_FF — reports never set
- * the compatible-vibration valid flag.
+ * applies them as full output reports: 0x02 on USB, 0x31 with CRC32 on Bluetooth.
+ * webOS passes Bluetooth pads to the kernel through uhid, so they expose hidraw too.
+ * Rumble stays on SDL/EV_FF — reports never set the compatible-vibration valid flag.
  */
 
 #include <stdbool.h>
@@ -16,7 +16,7 @@
 
 typedef struct dualsense_usb_t dualsense_usb_t;
 
-/** Open hidraw for this PS5 pad if it is on USB; NULL if Bluetooth / unavailable. */
+/** Open hidraw for this PS5 pad (USB or Bluetooth); NULL if no accessible node. */
 dualsense_usb_t *dualsense_usb_open(SDL_GameController *controller);
 
 void dualsense_usb_close(dualsense_usb_t *ds);

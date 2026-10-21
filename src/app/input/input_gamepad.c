@@ -408,7 +408,7 @@ void app_input_gamepad_set_adaptive_triggers(app_input_t *input, unsigned short 
         return;
     }
 #endif
-    /* Fallback: SDL SendEffect (often a no-op on webOS Bluetooth DualSense). */
+    /* Fallback when no hidraw node is accessible: SDL SendEffect (often a no-op on webOS). */
     uint8_t report[2 + 1 + DS_EFFECT_PAYLOAD_SIZE + 1 + DS_EFFECT_PAYLOAD_SIZE];
     memset(report, 0, sizeof(report));
     report[0] = 0x02;
