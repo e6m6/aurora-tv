@@ -20,6 +20,7 @@
 #define DS_PID_DS5 0x0ce6u
 #define DS_PID_EDGE 0x0df2u
 #define BUS_USB 0x03u
+#define BUS_BLUETOOTH 0x05u
 
 /* Hardcode ioctl numbers — webOS NDK may lack linux/hidraw.h. */
 #define HIDIOCGRAWINFO ((2U << 30) | (8U << 16) | ((unsigned) ('H') << 8) | 0x03U)
@@ -29,6 +30,16 @@
 #define DS_COMMON_OFF 1
 #define DS_COMMON_LEN 47
 #define DS_EFFECT_LEN 11
+
+/*
+ * Bluetooth output report 0x31 in SDL's HIDAPI layout: 0x02 header, common block, padding, CRC32.
+ * Unlike the kernel's sequence-tagged layout, it carries no sequence number, so it cannot collide
+ * with the 0x31 reports hid-playstation sends to the same pad for rumble.
+ */
+#define DS_BT_REPORT_LEN 78
+#define DS_BT_COMMON_OFF 2
+#define DS_BT_HEADER 0x02u
+#define DS_BT_CRC_SEED 0xa2u
 
 #define FLAG0_RIGHT_TRIGGER 0x04u
 #define FLAG0_LEFT_TRIGGER 0x08u
@@ -53,6 +64,7 @@ struct hidraw_devinfo {
 struct dualsense_usb_t {
     int fd;
     char path[32];
+    bool bluetooth;
     bool triggers_owned;
     bool lightbar_owned;
     bool player_led_owned;
@@ -96,29 +108,36 @@ static bool hidraw_read_uniq(int fd, char *out, size_t out_len) {
     return out[0] != '\0';
 }
 
-static bool hidraw_is_wired_dualsense(int fd) {
+/* Returns BUS_USB or BUS_BLUETOOTH for a DualSense node, 0 for anything else. */
+static uint32_t hidraw_dualsense_bus(int fd) {
     struct hidraw_devinfo info;
     memset(&info, 0, sizeof(info));
     if (ioctl(fd, HIDIOCGRAWINFO, &info) < 0) {
-        return false;
+        return 0;
     }
-    if (info.bustype != BUS_USB) {
-        return false;
+    if (info.bustype != BUS_USB && info.bustype != BUS_BLUETOOTH) {
+        return 0;
     }
     uint16_t vendor = (uint16_t) info.vendor;
     uint16_t product = (uint16_t) info.product;
-    return vendor == DS_VENDOR && (product == DS_PID_DS5 || product == DS_PID_EDGE);
+    if (vendor != DS_VENDOR || (product != DS_PID_DS5 && product != DS_PID_EDGE)) {
+        return 0;
+    }
+    return info.bustype;
 }
 
-static int open_wired_node(const char *path) {
+/* webOS hands Bluetooth pads to the kernel through uhid, so they get hidraw nodes like USB pads. */
+static int open_dualsense_node(const char *path, bool *bluetooth) {
     int fd = open(path, O_RDWR | O_NONBLOCK);
     if (fd < 0) {
         return -1;
     }
-    if (!hidraw_is_wired_dualsense(fd)) {
+    uint32_t bus = hidraw_dualsense_bus(fd);
+    if (bus == 0) {
         close(fd);
         return -1;
     }
+    *bluetooth = bus == BUS_BLUETOOTH;
     return fd;
 }
 
@@ -152,17 +171,41 @@ static void fill_common(uint8_t *c, const dualsense_usb_t *ds) {
     }
 }
 
-static bool flush_report(dualsense_usb_t *ds) {
-    uint8_t report[DS_USB_REPORT_LEN];
-    memset(report, 0, sizeof(report));
-    report[0] = 0x02;
-    fill_common(report + DS_COMMON_OFF, ds);
+static size_t build_bt_report(uint8_t *report, const dualsense_usb_t *ds) {
+    memset(report, 0, DS_BT_REPORT_LEN);
+    report[0] = 0x31;
+    report[1] = DS_BT_HEADER;
+    fill_common(report + DS_BT_COMMON_OFF, ds);
 
-    ssize_t n = write(ds->fd, report, sizeof(report));
-    if (n != (ssize_t) sizeof(report)) {
+    /* The pad drops Bluetooth output reports whose CRC32 (seeded with the 0xA2 HID header) is wrong. */
+    const uint8_t seed = DS_BT_CRC_SEED;
+    Uint32 crc = SDL_crc32(0, &seed, 1);
+    crc = SDL_crc32(crc, report, DS_BT_REPORT_LEN - 4);
+    report[DS_BT_REPORT_LEN - 4] = (uint8_t) crc;
+    report[DS_BT_REPORT_LEN - 3] = (uint8_t) (crc >> 8);
+    report[DS_BT_REPORT_LEN - 2] = (uint8_t) (crc >> 16);
+    report[DS_BT_REPORT_LEN - 1] = (uint8_t) (crc >> 24);
+    return DS_BT_REPORT_LEN;
+}
+
+static bool flush_report(dualsense_usb_t *ds) {
+    uint8_t report[DS_BT_REPORT_LEN];
+    size_t len;
+    if (ds->bluetooth) {
+        len = build_bt_report(report, ds);
+    } else {
+        memset(report, 0, DS_USB_REPORT_LEN);
+        report[0] = 0x02;
+        fill_common(report + DS_COMMON_OFF, ds);
+        len = DS_USB_REPORT_LEN;
+    }
+
+    ssize_t n = write(ds->fd, report, len);
+    if (n != (ssize_t) len) {
         if (!ds->write_fail_logged) {
-            commons_log_warn("Input", "DualSense USB write to %s failed: %s (further errors quiet)",
-                             ds->path, n < 0 ? strerror(errno) : "short write");
+            commons_log_warn("Input", "DualSense %s write to %s failed: %s (further errors quiet)",
+                             ds->bluetooth ? "Bluetooth" : "USB", ds->path,
+                             n < 0 ? strerror(errno) : "short write");
             ds->write_fail_logged = true;
         }
         return false;
@@ -190,12 +233,13 @@ dualsense_usb_t *dualsense_usb_open(SDL_GameController *controller) {
 #endif
 
     int fd = -1;
+    bool bluetooth = false;
     char path[32] = {0};
 
 #if SDL_VERSION_ATLEAST(2, 0, 18)
     const char *sdl_path = SDL_GameControllerPath(controller);
     if (sdl_path != NULL && strncmp(sdl_path, "/dev/hidraw", 11) == 0) {
-        fd = open_wired_node(sdl_path);
+        fd = open_dualsense_node(sdl_path, &bluetooth);
         if (fd >= 0) {
             snprintf(path, sizeof(path), "%s", sdl_path);
         }
@@ -204,11 +248,13 @@ dualsense_usb_t *dualsense_usb_open(SDL_GameController *controller) {
 
     if (fd < 0) {
         int fallback_fd = -1;
+        bool fallback_bluetooth = false;
         char fallback_path[32] = {0};
         for (int i = 0; i < MAX_HIDRAW_NODES; i++) {
             char candidate[32];
+            bool try_bluetooth = false;
             snprintf(candidate, sizeof(candidate), "/dev/hidraw%d", i);
-            int try_fd = open_wired_node(candidate);
+            int try_fd = open_dualsense_node(candidate, &try_bluetooth);
             if (try_fd < 0) {
                 continue;
             }
@@ -216,6 +262,7 @@ dualsense_usb_t *dualsense_usb_open(SDL_GameController *controller) {
                 char uniq[32];
                 if (hidraw_read_uniq(try_fd, uniq, sizeof(uniq)) && serials_match(uniq, serial)) {
                     fd = try_fd;
+                    bluetooth = try_bluetooth;
                     snprintf(path, sizeof(path), "%s", candidate);
                     if (fallback_fd >= 0) {
                         close(fallback_fd);
@@ -225,6 +272,7 @@ dualsense_usb_t *dualsense_usb_open(SDL_GameController *controller) {
                 }
                 if (fallback_fd < 0) {
                     fallback_fd = try_fd;
+                    fallback_bluetooth = try_bluetooth;
                     snprintf(fallback_path, sizeof(fallback_path), "%s", candidate);
                 } else {
                     close(try_fd);
@@ -232,11 +280,13 @@ dualsense_usb_t *dualsense_usb_open(SDL_GameController *controller) {
                 continue;
             }
             fd = try_fd;
+            bluetooth = try_bluetooth;
             snprintf(path, sizeof(path), "%s", candidate);
             break;
         }
         if (fd < 0 && fallback_fd >= 0) {
             fd = fallback_fd;
+            bluetooth = fallback_bluetooth;
             snprintf(path, sizeof(path), "%s", fallback_path);
         } else if (fallback_fd >= 0) {
             close(fallback_fd);
@@ -244,7 +294,7 @@ dualsense_usb_t *dualsense_usb_open(SDL_GameController *controller) {
     }
 
     if (fd < 0) {
-        commons_log_info("Input", "DualSense USB hidraw unavailable (Bluetooth or no node)");
+        commons_log_info("Input", "DualSense hidraw unavailable (no accessible node)");
         return NULL;
     }
 
@@ -254,8 +304,9 @@ dualsense_usb_t *dualsense_usb_open(SDL_GameController *controller) {
         return NULL;
     }
     ds->fd = fd;
+    ds->bluetooth = bluetooth;
     snprintf(ds->path, sizeof(ds->path), "%s", path);
-    commons_log_info("Input", "DualSense USB feedback on %s", ds->path);
+    commons_log_info("Input", "DualSense %s feedback on %s", bluetooth ? "Bluetooth" : "USB", ds->path);
     return ds;
 }
 
